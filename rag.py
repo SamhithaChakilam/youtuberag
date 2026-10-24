@@ -1,7 +1,6 @@
 import re
 import os
 from functools import lru_cache
-from youtube_transcript_api import YouTubeTranscriptApi
 import requests
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -59,52 +58,77 @@ def load_groq():
 
 
 def get_transcript(video_id):
-    """Fetch the YouTube transcript directly."""
+    api_key = os.getenv("FREETRANSCRIPT_API_KEY")
 
-    try:
-        api = YouTubeTranscriptApi()
+    if not api_key:
+        raise Exception("FREETRANSCRIPT_API_KEY is missing.")
 
-        transcript = api.fetch(video_id)
+    response = requests.get(
+        "https://api.freetranscriptapi.com/v1/transcript",
+        params={
+            "video_url": video_id,
+            "lang": "en"
+        },
+        headers={
+            "Authorization": f"Bearer {api_key}"
+        },
+        timeout=30
+    )
 
-        text = " ".join(
-            item.text.strip()
-            for item in transcript
-            if item.text.strip()
-        )
-
-        if not text.strip():
-            raise ValueError(
-                "This video has no usable transcript."
+    if not response.ok:
+        try:
+            error_data = response.json()
+            raise Exception(f"FreeTranscriptAPI error: {error_data}")
+        except ValueError:
+            raise Exception(
+                f"FreeTranscriptAPI error {response.status_code}: {response.text}"
             )
 
-        print("Transcript fetched successfully.")
-        print("Transcript length:", len(text))
+    data = response.json()
+    transcript_data = data.get("transcript")
 
-        return text
+    if not transcript_data:
+        raise Exception("No transcript found.")
 
-    except Exception as e:
-        print("Transcript error:", str(e))
+    text = " ".join(
+        item["text"].strip()
+        for item in transcript_data
+        if item.get("text")
+    )
 
-        raise Exception(
-            f"Unable to fetch transcript: {str(e)}"
-        )
+    if not text.strip():
+        raise Exception("Transcript is empty.")
+
+    print("Transcript fetched successfully.")
+    print("Transcript length:", len(text))
+
+    return text
+
 
 def create_chunks(text):
-    if not text:
-        raise ValueError("No transcript was retrieved.")
-
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=700,
         chunk_overlap=150,
-        separators=["\n\n", "\n", ". ", "? ", "! ", ", ", " ", ""]
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            " ",
+            ""
+        ]
     )
 
-    raw_chunks = splitter.split_text(text)
+    documents = splitter.create_documents([text])
 
     return [
-        {"id": index, "text": chunk.strip()}
-        for index, chunk in enumerate(raw_chunks)
-        if chunk.strip()
+        {
+            "id": index,
+            "text": document.page_content.strip()
+        }
+        for index, document in enumerate(documents)
+        if document.page_content.strip()
     ]
 
 
@@ -126,7 +150,11 @@ def build_video_index(video_id):
         embedding=load_embeddings()
     )
 
-    tokenized_chunks = [tokenize(text) for text in chunk_texts]
+    tokenized_chunks = [
+        tokenize(text)
+        for text in chunk_texts
+    ]
+
     bm25 = BM25Okapi(tokenized_chunks)
 
     return {
@@ -168,16 +196,24 @@ def reciprocal_rank_fusion(
     scores = {}
     documents = {}
 
-    for rank, document in enumerate(semantic_documents, start=1):
+    for rank, document in enumerate(
+        semantic_documents,
+        start=1
+    ):
         text = document.page_content.strip()
+
         if not text:
             continue
 
         documents[text] = document
         scores[text] = scores.get(text, 0) + 1 / (k + rank)
 
-    for rank, chunk in enumerate(keyword_chunks, start=1):
+    for rank, chunk in enumerate(
+        keyword_chunks,
+        start=1
+    ):
         text = chunk["text"].strip()
+
         if not text:
             continue
 
@@ -213,7 +249,11 @@ def add_neighbor_chunks(
 
         current_index = text_to_index[text]
 
-        start = max(0, current_index - neighbor_distance)
+        start = max(
+            0,
+            current_index - neighbor_distance
+        )
+
         end = min(
             len(all_chunks),
             current_index + neighbor_distance + 1
@@ -256,11 +296,16 @@ def retrieve_relevant_chunks(question, video_index):
     bm25 = video_index["bm25"]
 
     semantic_documents = semantic_search(
-        question, vectorstore, k=25
+        question,
+        vectorstore,
+        k=25
     )
 
     keyword_chunks = keyword_search(
-        question, chunks, bm25, k=25
+        question,
+        chunks,
+        bm25,
+        k=25
     )
 
     fused_documents = reciprocal_rank_fusion(
